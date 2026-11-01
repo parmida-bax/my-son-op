@@ -1,3 +1,4 @@
+# Managed by Remote-Op — re-rendered from the embedded template on Update; manual edits are overwritten
 name: son1
 on:
   workflow_dispatch:
@@ -144,9 +145,39 @@ jobs:
           # Fetch latest origin/beta
           git fetch origin beta
 
-          # Create / reset WF_NAME branch from origin/beta
-          git checkout -B "${WF_NAME}" origin/beta
-          echo "✅ Branch ${WF_NAME} created/reset from origin/beta"
+          # Sync the fork's beta from upstream (asgarimehdi/h-dashboard)
+          # BEFORE branching: this fork's beta usually lags upstream, so
+          # branching from origin/beta alone would boot stale code. Mirror
+          # upstream/beta onto the fork, then branch from the freshly
+          # synced origin/beta. If the push to the fork fails (e.g. this
+          # token cannot push there), do NOT fail the boot and do NOT
+          # silently keep the stale beta either: warn loudly and branch
+          # from upstream/beta for this run instead.
+          UPSTREAM_REPO="https://github.com/asgarimehdi/h-dashboard.git"
+          BASE_REF="origin/beta"
+          if [ "$REPO_ORIGIN" = "$UPSTREAM_REPO" ]; then
+            echo "ℹ️ REPO_ORIGIN is upstream itself — fork beta sync skipped"
+          else
+            git remote get-url upstream >/dev/null 2>&1 \
+              || git remote add upstream "$UPSTREAM_REPO"
+            if git fetch upstream beta; then
+              git checkout -B beta upstream/beta
+              git remote set-url origin "$(printf '%s' "$REPO_ORIGIN" | sed "s#^https://#https://x-access-token:${GH_TOKEN}@#")"
+              if git push origin beta; then
+                git fetch origin beta
+                echo "✅ Fork beta synced from upstream asgarimehdi/h-dashboard"
+              else
+                echo "⚠️⚠️ WARNING: could not push the synced beta to the fork — branching from upstream/beta for this run; the fork's beta stays stale"
+                BASE_REF="upstream/beta"
+              fi
+            else
+              echo "⚠️⚠️ WARNING: could not fetch upstream beta — branching from origin/beta (possibly stale) for this run"
+            fi
+          fi
+
+          # Create / reset WF_NAME branch from the synced beta
+          git checkout -B "${WF_NAME}" "$BASE_REF"
+          echo "✅ Branch ${WF_NAME} created/reset from $BASE_REF"
 
           cp .env.example.pgsql .env
 
@@ -218,6 +249,8 @@ jobs:
 
       - name: 11. Install 9router globally and create symlink
         run: |
+          # wreq-js is installed before 9router.
+          npm install -g wreq-js
           npm install -g 9router
           if [ -f ~/.npm-global/bin/9router ]; then
             sudo ln -sf ~/.npm-global/bin/9router /usr/local/bin/9router
@@ -278,8 +311,7 @@ jobs:
           #     GitHub releases): the fifth MCP server, ensured in §4. Its
           #     own OpenCode extras (skill, agents, plugin, instructions)
           #     are installed in §4b, and its index cache
-          #     (~/.cache/codebase-memory-mcp) is restored in §2 and synced
-          #     back to the repo in step 16.
+          #     (~/.cache/codebase-memory-mcp) is restored in §2.
           #     The binary MUST live in a user-owned dir
           #     ($HOME/.local/bin, no sudo): the `install -y` in §4b
           #     runs an activation transaction that refuses to
@@ -297,8 +329,8 @@ jobs:
             echo "✅ codebase-memory-mcp installed: $("$HOME/.local/bin/codebase-memory-mcp" --version)"
           fi
 
-          # 2. Restore the OpenCode backup from the repo (opencode/ dir,
-          #    synced back in step 16). config/ is SHARED by all four
+          # 2. Restore the OpenCode backup from the repo (opencode/ dir).
+          #    config/ is SHARED by all four
           #    instances (opencode.json, plugins, agents and skills —
           #    skills stay shared on purpose), while data and the
           #    codebase-memory index cache are PER-INSTANCE under
@@ -326,8 +358,8 @@ jobs:
           #    its own env vars. So the GitHub token (same MY_PAT gh uses)
           #    is exported here — opencode serve below inherits it, and
           #    the config in §4 references it as
-          #    {env:...}, so NO secret lands in opencode.json (which step 16
-          #    backs up to this repo). Persisted to ~/.bashrc as well, for
+          #    {env:...}, so NO secret lands in opencode.json.
+          #    Persisted to ~/.bashrc as well, for
           #    shells opened later over SSH.
           export GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN"
           echo "export GITHUB_PERSONAL_ACCESS_TOKEN=${GH_TOKEN}" >> ~/.bashrc
@@ -350,9 +382,8 @@ jobs:
           #    wanted servers (laravel-boost, github, codegraph, context7,
           #    codebase-memory-mcp), DROPS postgis for good (removed at
           #    Mehdi's request), and
-          #    PRESERVES any other server already in the config — servers
-          #    added at runtime are backed up by step 16 and must survive
-          #    restarts, so the mcp block is merged, never rewritten whole.
+          #    PRESERVES any other server already in the config — the
+          #    mcp block is merged, never rewritten whole.
           #    It also ensures the Superpowers plugin: V2 reads the
           #    `plugins` array; the V1 `plugin` key is mirrored with the
           #    same spec so a rollback to V1 would keep the plugin too.
@@ -473,8 +504,8 @@ jobs:
           # 4b. codebase-memory-mcp's own OpenCode integration: its skill
           #     (~/.config/opencode/skills/codebase-memory), three read-only
           #     agents, the cbm-augment plugin and AGENTS.md instructions.
-          #     Everything lands under ~/.config/opencode, so step 16 syncs
-          #     it like the rest of the config. Two installer quirks shape
+          #     Everything lands under ~/.config/opencode (restored in §2).
+          #     Two installer quirks shape
           #     this loop: (1) it aborts instantly when its binary is
           #     root-owned ("install_dir_not_owned_by_you") — hence the
           #     user-owned copy from §1b; with the old root-owned
@@ -506,8 +537,7 @@ jobs:
           fi
 
           # 4c. oh-my-opencode-slim: write/merge its config
-          #     (~/.config/opencode/oh-my-opencode-slim.json, synced by
-          #     step 16 like the rest of the config) with a "free" preset
+          #     (~/.config/opencode/oh-my-opencode-slim.json) with a "free" preset
           #     that puts EVERY agent on a free OpenCode Zen model, plus
           #     free councillors for the Council agent. The merge
           #     preserves any other presets/settings already present, and
@@ -535,12 +565,12 @@ jobs:
                   cfg = {}
           free_models = {
               "orchestrator": "opencode/deepseek-v4.1-flash-free",
-              "oracle": "opencode/nemotron-3-ultra-free",
+              "oracle": "opencode/nemotron-3.5-lightning-free",
               "explorer": "opencode/glm-5.3-flash-free",
               "fixer": "opencode/deepseek-v4.1-flash-free",
               "librarian": "opencode/glm-5.3-flash-free",
               "designer": "opencode/beam-free",
-              "council": "opencode/nemotron-3-ultra-free",
+              "council": "opencode/nemotron-3.5-lightning-free",
           }
           free_preset = cfg.setdefault("presets", {}).setdefault("free", {})
           for agent, model in free_models.items():
@@ -552,7 +582,7 @@ jobs:
           for stale in ("mimo", "spark"):
               councillors.pop(stale, None)
           for cname, cmodel in (("deepseek", "opencode/deepseek-v4.1-flash-free"),
-                                ("nemotron", "opencode/nemotron-3-ultra-free"),
+                                ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
           cfg["council"].setdefault("default_preset", "default")
@@ -588,79 +618,7 @@ jobs:
             echo "[$i/340] Server is active (SSH + Laravel :8000 + OpenCode :4096)..."
           done
 
-      - name: 16. Sync opencode state & 9router data back to my-opencode
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.MY_PAT }}
-        run: |
-          cd "${GITHUB_WORKSPACE:-.}"
-          git config user.name "sonia-shab"
-          git config user.email "sonia-shab@users.noreply.github.com"
-          # Authenticate with PAT for push
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/sonia-shab/my-son-op.git"
-
-          # 1. Copy OpenCode state back to the repo. Layout:
-          #    opencode/config mirrors ~/.config/opencode and is SHARED
-          #    by all four instances (skills included); everything
-          #    instance-specific goes under opencode/instances/<wf>/:
-          #    data mirrors ~/.local/share/opencode (sessions,
-          #    opencode.db, storage), cbm-cache mirrors
-          #    ~/.cache/codebase-memory-mcp, and 9router.sqlite is this
-          #    instance's 9router db. Restored in steps 12 and 13.
-          ODEST=opencode
-          OINST="$ODEST/instances/${WF_NAME}"
-          mkdir -p "$ODEST/config" "$OINST/data" "$OINST/cbm-cache"
-          [ -d ~/.config/opencode ] && cp -r ~/.config/opencode/. "$ODEST/config/"
-          [ -d ~/.local/share/opencode ] && cp -r ~/.local/share/opencode/. "$OINST/data/"
-          [ -d ~/.cache/codebase-memory-mcp ] && cp -r ~/.cache/codebase-memory-mcp/. "$OINST/cbm-cache/"
-          # Prune what must not be committed:
-          #  - data/auth.json holds provider API keys in plaintext — never
-          #    back credentials up to git (the free Zen model needs no key).
-          #  - data/snapshot (git object store behind session revert) and
-          #    data/log are bulky/regenerable; data/bin is downloaded tool
-          #    binaries; config/node_modules is plugin deps (reinstalled).
-          for junk in "$OINST/data/auth.json" "$OINST/data/snapshot" \
-                      "$OINST/data/log" "$OINST/data/bin" \
-                      "$ODEST/config/node_modules" \
-                      "$OINST/cbm-cache/logs"; do
-            if [ -e "$junk" ]; then
-              echo "🧹 Excluding from backup: $junk"
-              rm -rf "$junk"
-            fi
-          done
-          # Guard — no nested git repos inside the backup: a stray .git
-          # would be recorded as a gitlink (mode 160000) with no .gitmodules
-          # and the NEXT run's checkout dies with 'No url found for
-          # submodule path' (the my-sev/my-reb breakage). Strip any found.
-          find "$ODEST" -name .git -type d -prune -exec rm -rf {} + 2>/dev/null || true
-          find "$ODEST" -name .git -type f -delete 2>/dev/null || true
-          echo '✅ Copied OpenCode state → opencode/ (shared config + per-instance dirs) for backup'
-
-          # 2. Copy this instance's 9router database back to the repo
-          if [ -f ~/.9router/db/data.sqlite ]; then
-            cp ~/.9router/db/data.sqlite "$OINST/9router.sqlite"
-            echo '✅ Copied 9router db → opencode/instances/${WF_NAME}/9router.sqlite for backup'
-          fi
-
-          # 3. Commit & push if anything changed. Stage FIRST, then judge
-          #    from the staged diff: plain `git diff` is blind to untracked
-          #    files, so checking before `git add` misses a brand-new
-          #    opencode/ backup entirely (the first op2 run lost its backup
-          #    exactly this way — the step reported success in under a
-          #    second and pushed nothing).
-          git add -A opencode/
-          if git diff --cached --quiet; then
-            echo 'ℹ️ No changes to commit'
-          else
-            git commit -m "Sync opencode state & 9router data from son1 instance"
-            # Pull first in case another run pushed before us
-            git pull --rebase origin "${{ github.ref_name }}" || true
-            git push origin "${{ github.ref_name }}" || echo '⚠️ Push failed — changes saved locally'
-            echo '✅ OpenCode & 9router data synced to my-opencode'
-          fi
-
-
-      - name: 17. Tailscale Logout (cleanup on shutdown)
+      - name: 16. Tailscale Logout (cleanup on shutdown)
         if: always()
         run: |
           sudo tailscale logout || true
