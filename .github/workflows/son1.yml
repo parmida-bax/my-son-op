@@ -2,6 +2,18 @@
 name: son1
 on:
   workflow_dispatch:
+    inputs:
+      openrouter_account:
+        description: "OpenRouter account name (must exist in the OPENROUTER_KEYS secret JSON; empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+      openrouter_model:
+        description: "OpenRouter model id, e.g. vendor/model:free (empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+
 
 jobs:
   build:
@@ -285,6 +297,53 @@ jobs:
             echo '⚠️ 9router did not come up — check /tmp/9router.log'
           fi
 
+      # 12b. Per-run OpenRouter choice (Remote-Op dispatch inputs only).
+      #     Runs ONLY when a dispatch carried an account name; a plain
+      #     dispatch (or any other trigger) skips it and the run keeps
+      #     the current Zen setup. The token is NEVER sent in the
+      #     dispatch: it is read here from the OPENROUTER_KEYS secret
+      #     (one JSON object, account name -> token, set by the repo
+      #     owner), masked, and exported via $GITHUB_ENV so step 13
+      #     and the `opencode serve` process inherit OPENROUTER_API_KEY
+      #     from the environment — the built-in openrouter provider
+      #     authenticates from that variable, and no key is written
+      #     into opencode.json. Missing secret / bad JSON / unknown
+      #     account / missing model all fail fast, with the account
+      #     name only in the message — never the token or the JSON.
+      - name: 12b. Resolve OpenRouter account for this run only
+        if: inputs.openrouter_account != ''
+        env:
+          OPENROUTER_KEYS: ${{ secrets.OPENROUTER_KEYS }}
+          OPENROUTER_ACCOUNT: ${{ inputs.openrouter_account }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+        run: |
+          python3 - <<'PYEOF_OR'
+          import json, os, sys
+          keys_raw = os.environ.get("OPENROUTER_KEYS", "")
+          if not keys_raw:
+              print("::error::OPENROUTER_KEYS secret is not set on this repo — "
+                    "set it (JSON: account name -> token) or dispatch without an OpenRouter account")
+              sys.exit(1)
+          try:
+              keys = json.loads(keys_raw)
+          except Exception:
+              print("::error::OPENROUTER_KEYS is not valid JSON")
+              sys.exit(1)
+          account = os.environ.get("OPENROUTER_ACCOUNT", "")
+          model = os.environ.get("OPENROUTER_MODEL", "")
+          if not model:
+              print("::error::openrouter_model is empty — dispatch with both an account and a model")
+              sys.exit(1)
+          token = keys.get(account) if isinstance(keys, dict) else None
+          if not isinstance(token, str) or not token:
+              print(f"::error::OpenRouter account '{account}' not found in OPENROUTER_KEYS")
+              sys.exit(1)
+          print("::add-mask::" + token)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("OPENROUTER_API_KEY=" + token + "\n")
+              f.write("OPENROUTER_MODEL=" + model + "\n")
+          print(f"OpenRouter account '{account}' resolved for this run only")
+          PYEOF_OR
 
       - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
@@ -406,6 +465,16 @@ jobs:
           # /update could never persist, and the update banner
           # only adds noise when a release lands mid-run.
           cfg["autoupdate"] = False
+          # Per-run OpenRouter override (step 12b exported
+          # OPENROUTER_MODEL only when the dispatch carried an account
+          # + model). It wins over the per-instance file/variable/
+          # built-in resolution below, for this run only: the runner's
+          # config is never committed back, so the next plain dispatch
+          # restores the Zen model. The openrouter provider reads
+          # OPENROUTER_API_KEY from the environment (step 12b), so no
+          # key is written into this config.
+          _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
+          _or_model = ("openrouter/" + _or_raw if _or_raw and not _or_raw.startswith("openrouter/") else _or_raw)
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -445,7 +514,10 @@ jobs:
               else:
                   break
           _idx = int(_num) - 1 if _num else 0
-          cfg["model"] = _models[_idx % len(_models)]
+          if _or_model:
+              cfg["model"] = _or_model
+          else:
+              cfg["model"] = _models[_idx % len(_models)]
           mcp = cfg.get("mcp", {})
           mcp.pop("postgis", None)
           mcp.update({
@@ -585,6 +657,22 @@ jobs:
                                 ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
+          # Per-run OpenRouter override (same OPENROUTER_MODEL as §4):
+          # EVERY slim seat — agents, council and councillors — on the
+          # chosen model for this run only, and the preset forced to
+          # "free" so these seats are the ones actually used. The
+          # runner's slim config is never committed back, so the next
+          # plain dispatch restores the free-preset seats above.
+          _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
+          if _or_raw:
+              _or_model = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+              for _seat in list(free_preset.values()):
+                  if isinstance(_seat, dict):
+                      _seat["model"] = _or_model
+              for _seat in list(councillors.values()):
+                  if isinstance(_seat, dict):
+                      _seat["model"] = _or_model
+              cfg["preset"] = "free"
           cfg["council"].setdefault("default_preset", "default")
           cfg.setdefault("preset", "free")
           with open(path, "w") as f:
