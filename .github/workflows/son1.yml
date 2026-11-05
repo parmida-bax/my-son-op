@@ -13,6 +13,16 @@ on:
         required: false
         default: ""
         type: string
+      nvidia_account:
+        description: "NVIDIA account name (must exist in the NVIDIA_KEYS secret JSON; empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+      nvidia_model:
+        description: "NVIDIA NIM model id, e.g. nvidia/nemotron-3-ultra-550b-a55b (empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
 
 
 jobs:
@@ -345,6 +355,56 @@ jobs:
           print(f"OpenRouter account '{account}' resolved for this run only")
           PYEOF_OR
 
+      # 12c. Per-run NVIDIA choice (Remote-Op dispatch inputs only).
+      #     Runs ONLY when a dispatch carried an account name; a plain
+      #     dispatch (or any other trigger) skips it and the run keeps
+      #     the current Zen setup. Same shape as step 12b: the token is
+      #     NEVER sent in the dispatch — it is read here from the
+      #     NVIDIA_KEYS secret (one JSON object, account name -> token,
+      #     set by the repo owner), masked, and exported via
+      #     $GITHUB_ENV so step 13 and the `opencode serve` process
+      #     inherit NVIDIA_API_KEY from the environment. §4 writes the
+      #     `nvidia` provider block (OpenAI-compatible, NVIDIA NIM
+      #     endpoint) into opencode.json for this run only, reading
+      #     the key from that variable — no key is written into the
+      #     config. Missing secret / bad JSON / unknown account /
+      #     missing model all fail fast, with the account name only
+      #     in the message — never the token or the JSON.
+      - name: 12c. Resolve NVIDIA account for this run only
+        if: inputs.nvidia_account != ''
+        env:
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          NVIDIA_ACCOUNT: ${{ inputs.nvidia_account }}
+          NVIDIA_MODEL: ${{ inputs.nvidia_model }}
+        run: |
+          python3 - <<'PYEOF_NV'
+          import json, os, sys
+          keys_raw = os.environ.get("NVIDIA_KEYS", "")
+          if not keys_raw:
+              print("::error::NVIDIA_KEYS secret is not set on this repo — "
+                    "set it (JSON: account name -> token) or dispatch without an NVIDIA account")
+              sys.exit(1)
+          try:
+              keys = json.loads(keys_raw)
+          except Exception:
+              print("::error::NVIDIA_KEYS is not valid JSON")
+              sys.exit(1)
+          account = os.environ.get("NVIDIA_ACCOUNT", "")
+          model = os.environ.get("NVIDIA_MODEL", "")
+          if not model:
+              print("::error::nvidia_model is empty — dispatch with both an account and a model")
+              sys.exit(1)
+          token = keys.get(account) if isinstance(keys, dict) else None
+          if not isinstance(token, str) or not token:
+              print(f"::error::NVIDIA account '{account}' not found in NVIDIA_KEYS")
+              sys.exit(1)
+          print("::add-mask::" + token)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("NVIDIA_API_KEY=" + token + "\n")
+              f.write("NVIDIA_MODEL=" + model + "\n")
+          print(f"NVIDIA account '{account}' resolved for this run only")
+          PYEOF_NV
+
       - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
           OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
@@ -475,6 +535,30 @@ jobs:
           # key is written into this config.
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
           _or_model = ("openrouter/" + _or_raw if _or_raw and not _or_raw.startswith("openrouter/") else _or_raw)
+          # Per-run NVIDIA override (step 12c exported NVIDIA_MODEL
+          # only when the dispatch carried an account + model). Unlike
+          # the built-in openrouter provider, NVIDIA needs an explicit
+          # provider block: an OpenAI-compatible provider pointing at
+          # the NVIDIA NIM endpoint, reading its key from
+          # NVIDIA_API_KEY in the environment (step 12c), with the
+          # chosen model registered in its `models` map (OpenCode
+          # only resolves models listed there). The model id is the
+          # full NIM id (e.g. nvidia/nemotron-3-ultra-550b-a55b), so
+          # the OpenCode ref is nvidia/<that id>. The block is written
+          # only for an NVIDIA run; a plain dispatch leaves whatever
+          # provider block the restored config already had untouched
+          # (and the model resolution below restores the Zen model).
+          # When BOTH overrides are somehow set, NVIDIA wins — the
+          # Run dialog only ever sends one provider's inputs.
+          # The NIM id itself usually contains a slash (e.g.
+          # nvidia/nemotron-3-ultra-550b-a55b), so the OpenCode ref
+          # is nvidia/<NIM id> — three segments. A value already in
+          # that triple form has its first nvidia/ stripped back to
+          # the NIM id; anything else is taken as the NIM id as-is.
+          _nv_id = os.environ.get("NVIDIA_MODEL", "").strip()
+          if _nv_id.startswith("nvidia/nvidia/"):
+              _nv_id = _nv_id[len("nvidia/"):]
+          _nv_model = ("nvidia/" + _nv_id) if _nv_id else ""
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -514,7 +598,19 @@ jobs:
               else:
                   break
           _idx = int(_num) - 1 if _num else 0
-          if _or_model:
+          if _nv_model:
+              _nim_id = _nv_id
+              _prov = cfg.setdefault("provider", {})
+              _nvidia = _prov.setdefault("nvidia", {})
+              _nvidia["npm"] = "@ai-sdk/openai-compatible"
+              _nvidia["name"] = "NVIDIA NIM"
+              _nvidia_opts = _nvidia.setdefault("options", {})
+              _nvidia_opts["baseURL"] = "https://integrate.api.nvidia.com/v1"
+              _nvidia_opts["apiKey"] = "{env:NVIDIA_API_KEY}"
+              _nvidia.setdefault("models", {}).setdefault(
+                  _nim_id, {"name": _nim_id})
+              cfg["model"] = _nv_model
+          elif _or_model:
               cfg["model"] = _or_model
           else:
               cfg["model"] = _models[_idx % len(_models)]
@@ -657,21 +753,29 @@ jobs:
                                 ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
-          # Per-run OpenRouter override (same OPENROUTER_MODEL as §4):
-          # EVERY slim seat — agents, council and councillors — on the
-          # chosen model for this run only, and the preset forced to
-          # "free" so these seats are the ones actually used. The
-          # runner's slim config is never committed back, so the next
-          # plain dispatch restores the free-preset seats above.
+          # Per-run provider override (same NVIDIA_MODEL /
+          # OPENROUTER_MODEL as §4, NVIDIA checked first): EVERY slim
+          # seat — agents, council and councillors — on the chosen
+          # model for this run only, and the preset forced to "free"
+          # so these seats are the ones actually used. The runner's
+          # slim config is never committed back, so the next plain
+          # dispatch restores the free-preset seats above.
+          _nv_raw = os.environ.get("NVIDIA_MODEL", "").strip()
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
-          if _or_raw:
-              _or_model = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+          _override = ""
+          if _nv_raw:
+              _nv_id = _nv_raw[len("nvidia/"):] \
+                  if _nv_raw.startswith("nvidia/nvidia/") else _nv_raw
+              _override = "nvidia/" + _nv_id
+          elif _or_raw:
+              _override = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+          if _override:
               for _seat in list(free_preset.values()):
                   if isinstance(_seat, dict):
-                      _seat["model"] = _or_model
+                      _seat["model"] = _override
               for _seat in list(councillors.values()):
                   if isinstance(_seat, dict):
-                      _seat["model"] = _or_model
+                      _seat["model"] = _override
               cfg["preset"] = "free"
           cfg["council"].setdefault("default_preset", "default")
           cfg.setdefault("preset", "free")
